@@ -1,3 +1,6 @@
+// 2020/03/13 - modified by Tsung-Wei Huang
+//  - fixed bug in aligning memory
+//
 // 2020/02/02 - modified by Tsung-Wei Huang
 //  - new implementation motivated by Hoard
 // 
@@ -17,6 +20,10 @@
 #include <cstddef>
 
 namespace tf {
+
+#define TF_ENABLE_POOLABLE_ON_THIS                          \
+  template <typename T, size_t S> friend class ObjectPool;  \
+  void* _object_pool_block;
 
 // Class: ObjectPool
 //
@@ -74,12 +81,15 @@ class ObjectPool {
       size_t i;
       size_t u;
       T* top;
+      // long double padding;
       char data;
     };
   };
   
-  // the data column must be sufficient to hold the pointer in freelist
-  constexpr static size_t X = sizeof(Block**) + std::max(sizeof(T**), sizeof(T));
+  // the data column must be sufficient to hold the pointer in freelist  
+  //constexpr static size_t O = sizeof(long double)/sizeof(Block*);
+  constexpr static size_t X = std::max(sizeof(T*), sizeof(T));
+  //constexpr static size_t X = sizeof(long double) + std::max(sizeof(T*), sizeof(T));
   constexpr static size_t M = (S - offsetof(Block, data)) / X;
   constexpr static size_t F = 4;   
   constexpr static size_t B = F + 1;
@@ -557,10 +567,12 @@ void ObjectPool<T, S>::_for_each_block_safe(Blocklist* head, C&& c) {
 template <typename T, size_t S>
 T* ObjectPool<T, S>::_allocate(Block* s) {
   if(s->top == nullptr) {
-    auto beg = reinterpret_cast<Block**>(&s->data + s->i++ * X);
-    *beg = s;
+    //auto beg = reinterpret_cast<Block**>(&s->data + s->i++ * X);
+    //*beg = s;
     //printf("beg=%p data=%p s=%p\n", *beg, beg+1, s);
-    return reinterpret_cast<T*>(beg + 1);
+    //return reinterpret_cast<T*>(beg + O);  // (beg + 1) 
+    
+    return reinterpret_cast<T*>(&s->data + s->i++ * X);
   }
   else {
     T* retval = s->top;
@@ -585,7 +597,7 @@ T* ObjectPool<T, S>::allocate() {
   // my logically mapped heap
   LocalHeap& h = _this_heap(); 
   
-  Block* s;
+  Block* s {nullptr};
 
   h.mutex.lock();
   
@@ -668,6 +680,8 @@ T* ObjectPool<T, S>::allocate() {
 
   //printf("allocate %p (s=%p)\n", mem, s);
 
+  mem->_object_pool_block = s;
+
   return mem;
 }
   
@@ -679,7 +693,9 @@ void ObjectPool<T, S>::deallocate(T* mem) {
   //  reinterpret_cast<char*>(mem) - sizeof(Block**)
   //);
 
-  Block* s= *(reinterpret_cast<Block**>(mem) - 1);
+  //Block* s= *(reinterpret_cast<Block**>(mem) - O); //  (mem) - 1
+
+  Block* s = static_cast<Block*>(mem->_object_pool_block);
   
   //printf("deallocate %p (s=%p) M=%lu W=%lu X=%lu\n", mem, s, M, W, X);
 

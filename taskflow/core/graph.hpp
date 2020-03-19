@@ -14,7 +14,22 @@
 
 namespace tf {
 
+// ----------------------------------------------------------------------------
+// domain
+// ----------------------------------------------------------------------------
+
+enum Domain : int {
+  HOST = 0,
+#ifdef TF_ENABLE_CUDA
+  CUDA,
+#endif
+  HETEROGENEITY
+};
+
+
+// ----------------------------------------------------------------------------
 // Class: Graph
+// ----------------------------------------------------------------------------
 class Graph {
 
   friend class Node;
@@ -62,6 +77,8 @@ class Node {
   friend class Executor;
   friend class FlowBuilder;
   friend class Subflow;
+
+  TF_ENABLE_POOLABLE_ON_THIS;
 
   // state bit flag
   constexpr static int SPAWNED = 0x1;
@@ -140,9 +157,6 @@ class Node {
   
   public:
 
-    //Node() = default;
-
-    // Constructor 
     template <typename ...Args>
     Node(Args&&... args);
 
@@ -154,6 +168,8 @@ class Node {
     size_t num_weak_dependents() const;
     
     const std::string& name() const;
+
+    Domain domain() const;
 
   private:
 
@@ -170,7 +186,7 @@ class Node {
 
     int _state {0};
 
-    std::atomic<int> _join_counter {0};
+    std::atomic<size_t> _join_counter {0};
     
     void _precede(Node*);
     void _set_state(int);
@@ -304,6 +320,35 @@ inline size_t Node::num_strong_dependents() const {
 inline const std::string& Node::name() const {
   return _name;
 }
+
+// Function: domain
+inline Domain Node::domain() const {
+
+  Domain domain;
+
+  switch(_handle.index()) {
+
+    case STATIC_WORK:
+    case DYNAMIC_WORK:
+    case CONDITION_WORK:
+    case MODULE_WORK:
+      domain = Domain::HOST;
+    break;
+
+#ifdef TF_ENABLE_CUDA
+    case CUDAFLOW_WORK:
+      domain = Domain::CUDA;
+    break;
+#endif
+
+    default:
+      domain = Domain::HOST;
+    break;
+  }
+
+  return domain;
+}
+
 //
 //// Function: dump
 //inline std::string Node::dump() const {

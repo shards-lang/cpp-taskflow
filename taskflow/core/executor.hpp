@@ -26,31 +26,48 @@ namespace tf {
 @brief The executor class to run a taskflow graph.
 
 An executor object manages a set of worker threads and implements 
-an efficient work-stealing scheduling algorithm to run a task graph.
+an efficient work-stealing scheduling algorithm to run a taskflow.
 
 */
-
 class Executor {
-  
+
   struct Worker {
     unsigned id;
+    Domain domain;
+    Notifier::Waiter* waiter;
     std::mt19937 rdgen { std::random_device{}() };
-    TaskQueue<Node*> queue;
+    TaskQueue<Node*> wsq[HETEROGENEITY];
     Node* cache {nullptr};
-
-    int num_executed {0};
+    size_t num_executed {0};
   };
     
   struct PerThread {
     Worker* worker {nullptr};
   };
 
+#ifdef TF_ENABLE_CUDA
+  struct CUDADevice {
+    int id {-1};
+    std::vector<cudaStream_t> streams;
+  };
+#endif
+
   public:
-    
+
+#ifdef TF_ENABLE_CUDA    
     /**
     @brief constructs the executor with N worker threads
     */
-    explicit Executor(unsigned n = std::thread::hardware_concurrency());
+    explicit Executor(
+      unsigned N = std::thread::hardware_concurrency(),
+      unsigned M = cuda_num_devices()
+    );
+#else
+    /**
+    @brief constructs the executor with N worker threads
+    */
+    explicit Executor(unsigned N = std::thread::hardware_concurrency());
+#endif
     
     /**
     @brief destructs the executor 
@@ -131,10 +148,24 @@ class Executor {
 
     /**
     @brief queries the number of worker threads (can be zero)
-
-    @return the number of worker threads
     */
     size_t num_workers() const;
+    
+    /**
+    @brief queries the number of running topologies at the time of this call
+
+    When a taskflow is submitted to an executor, a topology is created to store
+    runtime metadata of the running taskflow.
+    */
+    size_t num_topologies() const;
+
+    /**
+    @brief queries the id of the caller thread in this executor
+
+    Each worker has an unique id from 0 to N-1 exclusive to the associated executor.
+    If the caller thread does not belong to the executor, -1 is returned.
+    */
+    int this_worker_id() const;
     
     /**
     @brief constructs an observer to inspect the activities of worker threads
@@ -157,34 +188,26 @@ class Executor {
     */
     void remove_observer();
 
-    /**
-    @brief queries the id of the caller thread in this executor
-
-    Each worker has an unique id from 0 to N-1 exclusive to the associated executor.
-    If the caller thread does not belong to the executor, -1 is returned.
-    */
-    int this_worker_id() const;
 
   private:
    
     std::condition_variable _topology_cv;
     std::mutex _topology_mutex;
-    std::mutex _queue_mutex;
+    std::mutex _wsq_mutex;
 
-    unsigned _num_topologies {0};
+    size_t _num_topologies {0};
     
     // scheduler field
     std::vector<Worker> _workers;
-    std::vector<Notifier::Waiter> _waiters;
     std::vector<std::thread> _threads;
+    
+    Notifier _notifier[HETEROGENEITY];
 
-    TaskQueue<Node*> _queue;
+    TaskQueue<Node*> _wsq[HETEROGENEITY];
 
-    std::atomic<size_t> _num_actives {0};
-    std::atomic<size_t> _num_thieves {0};
-    std::atomic<bool>   _done        {0};
-
-    Notifier _notifier;
+    std::atomic<size_t> _num_actives[HETEROGENEITY];
+    std::atomic<size_t> _num_thieves[HETEROGENEITY];
+    std::atomic<bool>   _done{0};
     
     std::unique_ptr<ExecutorObserverInterface> _observer;
     
@@ -194,7 +217,8 @@ class Executor {
 
     bool _wait_for_task(Worker&, Node*&);
     
-    void _spawn(unsigned);
+    void _spawn(unsigned, Domain);
+    void _worker_loop(Worker&);
     void _exploit_task(Worker&, Node*&);
     void _explore_task(Worker&, Node*&);
     void _schedule(Node*, bool);
@@ -217,18 +241,48 @@ class Executor {
     void _decrement_topology_and_notify();
 };
 
+
+#ifdef TF_ENABLE_CUDA
+// Constructor
+inline Executor::Executor(unsigned N, unsigned M) :
+  _workers  {N + M},
+  _notifier {Notifier(N), Notifier(M)} {
+
+  if(N == 0) {
+    TF_THROW("no cpu workers to execute taskflows");
+  }
+
+  if(M == 0) {
+    TF_THROW("no gpu workers to execute cudaflows");
+  }
+
+  for(int i=0; i<HETEROGENEITY; ++i) {
+    _num_actives[i].store(0, std::memory_order_relaxed);
+    _num_thieves[i].store(0, std::memory_order_relaxed); 
+  }
+
+  _spawn(N, HOST);
+  _spawn(M, CUDA);
+}
+
+#else
 // Constructor
 inline Executor::Executor(unsigned N) : 
   _workers  {N},
-  _waiters  {N},
-  _notifier {_waiters} {
+  _notifier {Notifier(N)} {
   
   if(N == 0) {
-    TF_THROW("no workers to execute the graph");
+    TF_THROW("no cpu workers to execute taskflows");
+  }
+  
+  for(int i=0; i<HETEROGENEITY; ++i) {
+    _num_actives[i].store(0, std::memory_order_relaxed);
+    _num_thieves[i].store(0, std::memory_order_relaxed); 
   }
 
-  _spawn(N);
+  _spawn(N, HOST);
 }
+#endif
 
 // Destructor
 inline Executor::~Executor() {
@@ -238,7 +292,10 @@ inline Executor::~Executor() {
   
   // shut down the scheduler
   _done = true;
-  _notifier.notify(true);
+
+  for(int i=0; i<HETEROGENEITY; ++i) {
+    _notifier[i].notify(true);
+  }
   
   for(auto& t : _threads){
     t.join();
@@ -248,6 +305,11 @@ inline Executor::~Executor() {
 // Function: num_workers
 inline size_t Executor::num_workers() const {
   return _workers.size();
+}
+
+// Function: num_topologies
+inline size_t Executor::num_topologies() const {
+  return _num_topologies;
 }
 
 // Function: _per_thread
@@ -263,20 +325,23 @@ inline int Executor::this_worker_id() const {
 }
 
 // Procedure: _spawn
-inline void Executor::_spawn(unsigned N) {
+inline void Executor::_spawn(unsigned N, Domain d) {
+  
+  auto id = _threads.size();
 
-  // Lock to synchronize all workers before creating _worker_maps
-  for(unsigned i=0; i<N; ++i) {
+  for(unsigned i=0; i<N; ++i, ++id) {
 
-    _workers[i].id = i;
-
+    _workers[id].id = id;
+    _workers[id].domain = d;
+    _workers[id].waiter = &_notifier[d]._waiters[i];
+    
     _threads.emplace_back([this] (Worker& w) -> void {
 
       PerThread& pt = _per_thread();  
       pt.worker = &w;
     
       Node* t = nullptr;
-      
+
       // must use 1 as condition instead of !done
       while(1) {
         
@@ -289,48 +354,18 @@ inline void Executor::_spawn(unsigned N) {
         }
       }
       
-    }, std::ref(_workers[i]));     
-  }
-}
-
-// Function: _find_victim
-inline unsigned Executor::_find_victim(unsigned thief) {
-  
-  /*unsigned l = 0;
-  unsigned r = _workers.size() - 1;
-  unsigned vtm = std::uniform_int_distribution<unsigned>{l, r}(
-    _workers[thief].rdgen
-  );
-
-  // try to look for a task from other workers
-  for(unsigned i=0; i<_workers.size(); ++i){
-
-    if((thief == vtm && !_queue.empty()) ||
-       (thief != vtm && !_workers[vtm].queue.empty())) {
-      return vtm;
-    }
-
-    if(++vtm; vtm == _workers.size()) {
-      vtm = 0;
-    }
-  } */
-
-  // try to look for a task from other workers
-  for(unsigned vtm=0; vtm<_workers.size(); ++vtm){
-    if((thief == vtm && !_queue.empty()) ||
-       (thief != vtm && !_workers[vtm].queue.empty())) {
-      return vtm;
-    }
+    }, std::ref(_workers[id]));     
   }
 
-  return static_cast<unsigned>(_workers.size());
 }
 
 // Function: _explore_task
 inline void Executor::_explore_task(Worker& thief, Node*& t) {
   
-  //assert(_workers[thief].queue.empty());
+  //assert(_workers[thief].wsq.empty());
   assert(!t);
+
+  const auto d = thief.domain;
 
   const unsigned l = 0;
   const unsigned r = static_cast<unsigned>(_workers.size()) - 1;
@@ -346,7 +381,7 @@ inline void Executor::_explore_task(Worker& thief, Node*& t) {
   
     unsigned vtm = std::uniform_int_distribution<unsigned>{l, r}(thief.rdgen);
       
-    t = (vtm == thief.id) ? _queue.steal() : _workers[vtm].queue.steal();
+    t = (vtm == thief.id) ? _wsq[d].steal() : _workers[vtm].wsq[d].steal();
 
     if(t) {
       break;
@@ -358,21 +393,6 @@ inline void Executor::_explore_task(Worker& thief, Node*& t) {
         break;
       }
     }
-
-    /*if(auto vtm = _find_victim(thief); vtm != _workers.size()) {
-      t = (vtm == thief) ? _queue.steal() : _workers[vtm].queue.steal();
-      // successful thief
-      if(t) {
-        break;
-      }
-    }
-    else {
-      if(f++ > F) {
-        if(std::this_thread::yield(); y++ > Y) {
-          break;
-        }
-      }
-    }*/
   }
 
 }
@@ -383,31 +403,18 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
   assert(!w.cache);
 
   if(t) {
-    if(_num_actives.fetch_add(1) == 0 && _num_thieves == 0) {
-      _notifier.notify(false);
-    }
 
+    const auto d = w.domain;
+
+    if(_num_actives[d].fetch_add(1) == 0 && _num_thieves[d] == 0) {
+      _notifier[d].notify(false);
+    }
+    
     auto tpg = t->_topology;
     auto par = t->_parent;
     w.num_executed = 1;
 
     do {
-      // Only joined subflow will enter block
-      // Flush the num_executed if encountering a different subflow
-      //if((*t)->_parent != par) {
-      //  if(par == nullptr) {
-      //    (*t)->_topology->_join_counter.fetch_sub(w.num_executed);
-      //  }
-      //  else {
-      //    auto ret = par->_join_counter.fetch_sub(w.num_executed);
-      //    if(ret == w.num_executed) {
-      //      _schedule(par, false);
-      //    }
-      //  }
-      //  w.num_executed = 1;
-      //  par = (*t)->_parent;
-      //}
-
       _invoke(w, t);
 
       if(w.cache) {
@@ -415,9 +422,9 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
         w.cache = nullptr;
       }
       else {
-        t = w.queue.pop();
+        t = w.wsq[d].pop();
         if(t) {
-          // We only increment the counter when poping task from queue 
+          // We only increment the counter when poping task from wsq 
           // (NOT including cache!)
           if(t->_parent == par) {
             w.num_executed ++;
@@ -432,7 +439,7 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
               auto ret = par->_join_counter.fetch_sub(w.num_executed);
               if(ret == w.num_executed) {
                 //_schedule(par, false);
-                w.queue.push(par);
+                w.wsq[d].push(par);
               }
             }
             w.num_executed = 1;
@@ -446,7 +453,7 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
               // TODO: Store tpg in local variable not in w
               _tear_down_topology(&tpg);
               if(tpg != nullptr) {
-                t = w.queue.pop();
+                t = w.wsq[d].pop();
                 if(t) {
                   w.num_executed = 1;
                 }
@@ -464,46 +471,44 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
       }
     } while(t);
 
-    --_num_actives;
+    --_num_actives[d];
   }
 }
 
 // Function: _wait_for_task
 inline bool Executor::_wait_for_task(Worker& worker, Node*& t) {
 
+  const auto d = worker.domain;
+
   wait_for_task:
 
   assert(!t);
 
-  ++_num_thieves;
+  ++_num_thieves[d];
 
   explore_task:
 
   _explore_task(worker, t);
 
   if(t) {
-    auto N = _num_thieves.fetch_sub(1);
-    if(N == 1) {
-      _notifier.notify(false);
+    if(_num_thieves[d].fetch_sub(1) == 1) {
+      _notifier[d].notify(false);
     }
     return true;
   }
 
-  auto waiter = &_waiters[worker.id];
-
-  _notifier.prepare_wait(waiter);
+  _notifier[d].prepare_wait(worker.waiter);
   
   //if(auto vtm = _find_victim(me); vtm != _workers.size()) {
-  if(!_queue.empty()) {
+  if(!_wsq[d].empty()) {
 
-    _notifier.cancel_wait(waiter);
-    //t = (vtm == me) ? _queue.steal() : _workers[vtm].queue.steal();
+    _notifier[d].cancel_wait(worker.waiter);
+    //t = (vtm == me) ? _wsq.steal() : _workers[vtm].wsq.steal();
     
-    t = _queue.steal();
+    t = _wsq[d].steal();
     if(t) {
-      auto N = _num_thieves.fetch_sub(1);
-      if(N == 1) {
-        _notifier.notify(false);
+      if(_num_thieves[d].fetch_sub(1) == 1) {
+        _notifier[d].notify(false);
       }
       return true;
     }
@@ -513,19 +518,30 @@ inline bool Executor::_wait_for_task(Worker& worker, Node*& t) {
   }
 
   if(_done) {
-    _notifier.cancel_wait(waiter);
-    _notifier.notify(true);
-    --_num_thieves;
+    _notifier[d].cancel_wait(worker.waiter);
+    for(int i=0; i<HETEROGENEITY; ++i) {
+      _notifier[i].notify(true);
+    }
+    --_num_thieves[d];
     return false;
   }
 
-  if(_num_thieves.fetch_sub(1) == 1 && _num_actives) {
-    _notifier.cancel_wait(waiter);
-    goto wait_for_task;
+  if(_num_thieves[d].fetch_sub(1) == 1) {
+    if(_num_actives[d]) {
+      _notifier[d].cancel_wait(worker.waiter);
+      goto wait_for_task;
+    }
+    // check all domain queue again
+    for(auto& w : _workers) {
+      if(!w.wsq[d].empty()) {
+        _notifier[d].cancel_wait(worker.waiter);
+        goto wait_for_task;
+      }
+    }
   }
     
   // Now I really need to relinguish my self to others
-  _notifier.commit_wait(waiter);
+  _notifier[d].commit_wait(worker.waiter);
 
   return true;
 }
@@ -548,31 +564,38 @@ inline void Executor::remove_observer() {
 // Procedure: _schedule
 // The main procedure to schedule a give task node.
 // Each task node has two types of tasks - regular and subflow.
-inline void Executor::_schedule(Node* node, bool bypass) {
+inline void Executor::_schedule(Node* node, bool bypass_hint) {
   
   //assert(_workers.size() != 0);
+
+  const auto d = node->domain();
   
   // caller is a worker to this pool
   auto worker = _per_thread().worker;
 
   if(worker != nullptr) {
-    if(!bypass) {
-      worker->queue.push(node);
-    }
-    else {
+    if(bypass_hint) {
       assert(!worker->cache);
       worker->cache = node;
+    }
+    else {
+      worker->wsq[d].push(node);
+      if(worker->domain != d) {
+        if(_num_actives[d] == 0 && _num_thieves[d] == 0) {
+          _notifier[d].notify(false);
+        }
+      }
     }
     return;
   }
 
   // other threads
   {
-    std::lock_guard<std::mutex> lock(_queue_mutex);
-    _queue.push(node);
+    std::lock_guard<std::mutex> lock(_wsq_mutex);
+    _wsq[d].push(node);
   }
 
-  _notifier.notify(false);
+  _notifier[d].notify(false);
 }
 
 // Procedure: _schedule
@@ -593,28 +616,43 @@ inline void Executor::_schedule(PassiveVector<Node*>& nodes) {
   // worker thread
   auto worker = _per_thread().worker;
 
+  // task counts
+  size_t tcount[HETEROGENEITY];
+
+  for(int d=0; d<HETEROGENEITY; ++d) {
+    tcount[d] = 0;
+  }
+
   if(worker != nullptr) {
     for(size_t i=0; i<num_nodes; ++i) {
-      worker->queue.push(nodes[i]);
+      const auto d = nodes[i]->domain();
+      worker->wsq[d].push(nodes[i]);
+      tcount[d]++;
     }
+    
+    for(int d=0; d<HETEROGENEITY; ++d) {
+      if(tcount[d] && d != worker->domain) {
+        if(_num_actives[d] == 0 && _num_thieves[d] == 0) {
+          _notifier[d].notify_n(tcount[d]);
+        }
+      }
+    }
+
     return;
   }
   
   // other threads
   {
-    std::lock_guard<std::mutex> lock(_queue_mutex);
+    std::lock_guard<std::mutex> lock(_wsq_mutex);
     for(size_t k=0; k<num_nodes; ++k) {
-      _queue.push(nodes[k]);
+      const auto d = nodes[k]->domain();
+      _wsq[d].push(nodes[k]);
+      tcount[d]++;
     }
   }
-
-  if(num_nodes >= _workers.size()) {
-    _notifier.notify(true);
-  }
-  else {
-    for(size_t k=0; k<num_nodes; ++k) {
-      _notifier.notify(false);
-    }
+  
+  for(int d=0; d<HETEROGENEITY; ++d) {
+    _notifier[d].notify_n(tcount[d]);
   }
 }
 
@@ -722,7 +760,7 @@ inline void Executor::_invoke(Worker& worker, Node* node) {
 
       if(id >= 0 && static_cast<size_t>(id) < num_successors) {
         node->_successors[id]->_join_counter.store(0);
-        _schedule(node->_successors[id], true);
+        _schedule(node->_successors[id], node->_successors[id]->domain() == worker.domain);
       }
       return ;
     }  // no need to add a break here due to the immediate return
@@ -763,14 +801,21 @@ inline void Executor::_invoke(Worker& worker, Node* node) {
 
   for(size_t i=0; i<num_successors; ++i) {
     if(--(node->_successors[i]->_join_counter) == 0) {
-      if(cache) {
-        if(num_spawns == 0) {
+      if(node->_successors[i]->domain() != worker.domain) {
+        if(num_spawns++ == 0) {
           c.fetch_add(num_successors);
         }
-        num_spawns++;
-        _schedule(cache, false);
+        _schedule(node->_successors[i], false);
       }
-      cache = node->_successors[i];
+      else {
+        if(cache) {
+          if(num_spawns++ == 0) {
+            c.fetch_add(num_successors);
+          }
+          _schedule(cache, false);
+        }
+        cache = node->_successors[i];
+      }
     }
   }
 
@@ -822,6 +867,9 @@ inline void Executor::_invoke_condition_work(Worker& worker, Node* node, int& id
 #ifdef TF_ENABLE_CUDA
 // Procedure: _invoke_cudaflow_work
 inline void Executor::_invoke_cudaflow_work(Worker& worker, Node* node) {
+
+  assert(worker.domain == node->domain());
+
   if(_observer) {
     _observer->on_entry(worker.id, TaskView(node));
     _invoke_cudaflow_work_impl(worker, node);
