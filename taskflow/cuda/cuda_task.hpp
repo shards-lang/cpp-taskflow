@@ -2,24 +2,65 @@
 
 #include "cuda_graph.hpp"
 
+/** 
+@file cuda_task.hpp
+@brief cudaTask include file
+*/
+
 namespace tf {
 
-/**
-@struct is_cudaflow_task
+// ----------------------------------------------------------------------------
+// cudaTask Types
+// ----------------------------------------------------------------------------
 
-@brief determines if a callable is a cudaflow task
+/**
+@enum cudaTaskType
+
+@brief enumeration of all %cudaTask types
 */
-template <typename C>
-constexpr bool is_cudaflow_task_v = is_invocable_r_v<void, C, cudaFlow&>;
+enum class cudaTaskType : int {
+  EMPTY = 0, 
+  HOST,
+  MEMSET,
+  MEMCPY,
+  KERNEL,
+  SUBFLOW,
+  CAPTURE,
+  UNDEFINED
+};
+
+/**
+@brief convert a cuda_task type to a human-readable string
+*/
+constexpr const char* to_string(cudaTaskType type) {
+  switch(type) {
+    case cudaTaskType::EMPTY:   return "empty";
+    case cudaTaskType::HOST:    return "host";
+    case cudaTaskType::MEMSET:  return "memset";
+    case cudaTaskType::MEMCPY:  return "memcpy";
+    case cudaTaskType::KERNEL:  return "kernel";
+    case cudaTaskType::SUBFLOW: return "subflow";
+    case cudaTaskType::CAPTURE: return "capture";
+    default:                    return "undefined";
+  }
+}
+
+// ----------------------------------------------------------------------------
+// cudaTask 
+// ----------------------------------------------------------------------------
 
 /**
 @class cudaTask
 
-@brief handle to a node in a cudaGraph
+@brief handle to a node of the internal CUDA graph
 */
 class cudaTask {
 
   friend class cudaFlow;
+  friend class cudaFlowCapturer;
+  friend class cudaFlowCapturerBase;
+
+  friend std::ostream& operator << (std::ostream&, const cudaTask&);
 
   public:
     
@@ -41,7 +82,7 @@ class cudaTask {
     /**
     @brief adds precedence links from this to other tasks
 
-    @tparam Ts... parameter pack
+    @tparam Ts parameter pack
 
     @param tasks one or multiple tasks
 
@@ -53,7 +94,7 @@ class cudaTask {
     /**
     @brief adds precedence links from other tasks to this
 
-    @tparam Ts... parameter pack
+    @tparam Ts parameter pack
 
     @param tasks one or multiple tasks
 
@@ -86,27 +127,25 @@ class cudaTask {
     */
     bool empty() const;
 
+    /**
+    @brief queries the task type
+    */
+    cudaTaskType type() const;
+
+    /**
+    @brief dumps the task through an output stream
+    
+    @tparam T output stream type with insertion operator (<<) defined
+    @param ostream an output stream target
+    */
+    template <typename T>
+    void dump(T& ostream) const;
+
   private:
     
     cudaTask(cudaNode*);
 
     cudaNode* _node {nullptr};
-    
-    /// @private
-    template <typename T>
-    void _precede(T&&);
-
-    /// @private
-    template <typename T, typename... Ts>
-    void _precede(T&&, Ts&&...);
-    
-    /// @private
-    template <typename T>
-    void _succeed(T&&);
-
-    // @private
-    template <typename T, typename... Ts>
-    void _succeed(T&&, Ts&&...);
 };
 
 // Constructor
@@ -116,45 +155,15 @@ inline cudaTask::cudaTask(cudaNode* node) : _node {node} {
 // Function: precede
 template <typename... Ts>
 cudaTask& cudaTask::precede(Ts&&... tasks) {
-  _precede(std::forward<Ts>(tasks)...);
+  (_node->_precede(tasks._node), ...);
   return *this;
-}
-
-/// @private
-// Procedure: precede
-template <typename T>
-void cudaTask::_precede(T&& other) {
-  _node->_precede(other._node);
-}
-
-/// @private
-// Procedure: _precede
-template <typename T, typename... Ts>
-void cudaTask::_precede(T&& task, Ts&&... others) {
-  _precede(std::forward<T>(task));
-  _precede(std::forward<Ts>(others)...);
 }
 
 // Function: succeed
 template <typename... Ts>
 cudaTask& cudaTask::succeed(Ts&&... tasks) {
-  _succeed(std::forward<Ts>(tasks)...);
+  (tasks._node->_precede(_node), ...);
   return *this;
-}
-
-/// @private
-// Procedure: _succeed
-template <typename T>
-void cudaTask::_succeed(T&& other) {
-  other._node->_precede(_node);
-}
-
-/// @private
-// Procedure: _succeed
-template <typename T, typename... Ts>
-void cudaTask::_succeed(T&& task, Ts&&... others) {
-  _succeed(std::forward<T>(task));
-  _succeed(std::forward<Ts>(others)...);
 }
 
 // Function: empty
@@ -178,61 +187,41 @@ inline size_t cudaTask::num_successors() const {
   return _node->_successors.size();
 }
 
-//// Function: kernel
-//template <typename F, typename... ArgsT>
-//cudaTask& cudaTask::kernel(
-//  dim3 grid, dim3 block, size_t shm, F&& func, ArgsT&&... args
-//) {
-//
-//  using traits = function_traits<F>;
-//
-//  static_assert(traits::arity == sizeof...(ArgsT), "arity mismatches");
-//
-//  void* arguments[sizeof...(ArgsT)] = { &args... };
-//
-//  auto& p = _node->_handle.emplace<cudaNode::Kernel>().param;
-//
-//  p.func = (void*)func;
-//  p.gridDim = grid;
-//  p.blockDim = block;
-//  p.sharedMemBytes = shm;
-//  p.kernelParams = arguments;
-//  p.extra = nullptr;
-//  
-//  TF_CHECK_CUDA(
-//    ::cudaGraphAddKernelNode(&_node->_node, _node->_graph._handle, nullptr, 0, &p),
-//    "failed to create a cudaKernel node"
-//  );
-//  
-//  return *this;
-//}
-//
-//// Function: copy
-//template <
-//  typename T,
-//  std::enable_if_t<!std::is_same<T, void>::value, void>*
-//>
-//cudaTask& cudaTask::copy(T* tgt, T* src, size_t num) {
-//
-//  using U = std::decay_t<T>;
-//
-//  auto& p = _node->_handle.emplace<cudaNode::Copy>().param;
-//
-//  p.srcArray = nullptr;
-//  p.srcPos = ::make_cudaPos(0, 0, 0);
-//  p.srcPtr = ::make_cudaPitchedPtr(src, num*sizeof(U), num, 1);
-//  p.dstArray = nullptr;
-//  p.dstPos = ::make_cudaPos(0, 0, 0);
-//  p.dstPtr = ::make_cudaPitchedPtr(tgt, num*sizeof(U), num, 1);
-//  p.extent = ::make_cudaExtent(num*sizeof(U), 1, 1);
-//  p.kind = cudaMemcpyDefault;
-//
-//  TF_CHECK_CUDA(
-//    cudaGraphAddMemcpyNode(&_node->_node, _node->_graph._handle, nullptr, 0, &p),
-//    "failed to create a cudaCopy node"
-//  );
-//
-//  return *this;
-//}
+// Function: type
+inline cudaTaskType cudaTask::type() const {
+  switch(_node->_handle.index()) {
+    case cudaNode::EMPTY:   return cudaTaskType::HOST;
+    case cudaNode::MEMSET:  return cudaTaskType::MEMSET;
+    case cudaNode::MEMCPY:  return cudaTaskType::MEMCPY;
+    case cudaNode::KERNEL:  return cudaTaskType::KERNEL;
+    case cudaNode::SUBFLOW: return cudaTaskType::SUBFLOW;
+    case cudaNode::CAPTURE: return cudaTaskType::CAPTURE;
+    default:                return cudaTaskType::UNDEFINED;
+  }
+}
+
+// Procedure: dump
+template <typename T>
+void cudaTask::dump(T& os) const {
+  os << "cudaTask ";
+  if(_node->_name.empty()) os << _node;
+  else os << _node->_name;
+  os << " [type=" << to_string(type()) << ']';
+}
+
+// ----------------------------------------------------------------------------
+// global ostream
+// ----------------------------------------------------------------------------
+
+/**
+@brief overload of ostream inserter operator for cudaTask
+*/
+inline std::ostream& operator << (std::ostream& os, const cudaTask& ct) {
+  ct.dump(os);
+  return os;
+}
 
 }  // end of namespace tf -----------------------------------------------------
+
+
+

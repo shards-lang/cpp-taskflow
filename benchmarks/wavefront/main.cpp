@@ -1,6 +1,13 @@
 #include "matrix.hpp"
 #include <CLI11.hpp>
 
+int M = 0;
+int N = 0;
+int B = 0;
+int MB = 0;
+int NB = 0;
+double **matrix = nullptr;
+
 void wavefront(
   const std::string& model,
   const unsigned num_threads, 

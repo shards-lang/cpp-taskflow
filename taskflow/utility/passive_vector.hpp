@@ -13,7 +13,10 @@ namespace tf {
 template <typename T, size_t S = 4, typename A = std::allocator<T>>
 class PassiveVector {
 
-  static_assert(std::is_pod<T>::value, "must be a passive data structure type");
+  static_assert(
+    std::is_trivial<T>::value && std::is_standard_layout<T>::value, 
+    "must be a plain old data type"
+  );
 
   public:
 
@@ -170,7 +173,7 @@ class PassiveVector {
 
     size_type size() const     { return _num; }
     size_type capacity() const { return _cap; }
-    size_type max_size() const { return std::numeric_limits<size_type>::max(); }
+    size_type max_size() const { return (std::numeric_limits<size_type>::max)(); }
 
     bool operator == (const PassiveVector& rhs) const {
       if(_num != rhs._num) {

@@ -81,7 +81,7 @@ class Notifier {
     };
   };
 
-  explicit Notifier(unsigned N) : _waiters{N} {
+  explicit Notifier(size_t N) : _waiters{N} {
     assert(_waiters.size() < (1 << kWaiterBits) - 1);
     // Initialize epoch to something close to overflow to test overflow.
     _state = kStackMask | (kEpochMask - kEpochInc * _waiters.size() * 2);
@@ -199,15 +199,19 @@ class Notifier {
   }
   
   // notify n workers
-  void notify_n(unsigned n) {
+  void notify_n(size_t n) {
     if(n >= _waiters.size()) {
       notify(true);
     }
     else {
-      for(unsigned k=0; k<n; ++k) {
+      for(size_t k=0; k<n; ++k) {
         notify(false);
       }
     }
+  }
+
+  size_t size() const {
+    return _waiters.size();
   }
 
  private:
@@ -253,15 +257,6 @@ class Notifier {
     }
   }
 
-  Notifier(const Notifier&) = delete;
-  Notifier& operator=(const Notifier&) = delete;
-
-  Notifier(Notifier&& rhs) : 
-    _state   {rhs._state.load()},
-    _waiters {std::move(rhs._waiters)} {
-  }
-
-  
 };
 
 

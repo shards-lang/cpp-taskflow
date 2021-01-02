@@ -23,7 +23,7 @@ namespace tf {
 
 #define TF_ENABLE_POOLABLE_ON_THIS                          \
   template <typename T, size_t S> friend class ObjectPool;  \
-  void* _object_pool_block;
+  void* _object_pool_block
 
 // Class: ObjectPool
 //
@@ -64,33 +64,11 @@ namespace tf {
 template <typename T, size_t S = 65536>
 class ObjectPool { 
   
-  class LocalHeap;
-
-  union Block;
-
-  struct Blocklist {
-    Blocklist* prev;
-    Blocklist* next;
-  };
-
-  union Block {
-    char buffer[S];
-    struct {
-      LocalHeap* heap;
-      Blocklist list_node;
-      size_t i;
-      size_t u;
-      T* top;
-      // long double padding;
-      char data;
-    };
-  };
-  
   // the data column must be sufficient to hold the pointer in freelist  
-  //constexpr static size_t O = sizeof(long double)/sizeof(Block*);
-  constexpr static size_t X = std::max(sizeof(T*), sizeof(T));
+  constexpr static size_t X = (std::max)(sizeof(T*), sizeof(T));
   //constexpr static size_t X = sizeof(long double) + std::max(sizeof(T*), sizeof(T));
-  constexpr static size_t M = (S - offsetof(Block, data)) / X;
+  //constexpr static size_t M = (S - offsetof(Block, data)) / X;
+  constexpr static size_t M = S / X;
   constexpr static size_t F = 4;   
   constexpr static size_t B = F + 1;
   constexpr static size_t W = (M + F - 1) / F;
@@ -101,12 +79,13 @@ class ObjectPool {
   );
 
   static_assert(
-    sizeof(Block) == S, "block size S is too small"
+    M >= 128, "block size S must be larger enough to pool at least 128 objects"
   );
-
-  static_assert(
-    M >= 16, "block size S must be larger enough to pool at least 16 objects"
-  );
+  
+  struct Blocklist {
+    Blocklist* prev;
+    Blocklist* next;
+  };
 
   class GlobalHeap {
     friend class ObjectPool;
@@ -122,6 +101,16 @@ class ObjectPool {
     size_t a {0};
   };
 
+  struct Block {
+    LocalHeap* heap;
+    Blocklist list_node;
+    size_t i;
+    size_t u;
+    T* top;
+    // long double padding;
+    char data[S];
+  };
+
   public:
     
     /**
@@ -135,14 +124,15 @@ class ObjectPool {
     ~ObjectPool();
     
     /**
-    @brief allocates an uninitialized storage to hold an object of type T
+    @brief acquires a pointer to a object constructed from a given argument list
     */
-    T* allocate();
+    template <typename... ArgsT>
+    T* animate(ArgsT&&... args);
     
     /**
-    @brief deallocates (recycles) a storage referenced by the pointer @c ptr
+    @brief recycles a object pointed by @c ptr and destroys it
     */
-    void deallocate(T* ptr);
+    void recycle(T* ptr);
     
     size_t num_bins_per_local_heap() const;
     size_t num_objects_per_bin() const;
@@ -166,7 +156,7 @@ class ObjectPool {
 
     LocalHeap& _this_heap();
 
-    constexpr unsigned _next_power_of_two(unsigned n) const;
+    constexpr unsigned _next_pow2(unsigned n) const;
 
     template <class P, class Q>
     constexpr size_t _offset_in_class(const Q P::*member) const;
@@ -214,10 +204,10 @@ class ObjectPool {
 // Constructor
 template <typename T, size_t S>
 ObjectPool<T, S>::ObjectPool(unsigned t) :
-  //_heap_mask   {(_next_power_of_two(t) << 1) - 1u},
-  //_heap_mask   { _next_power_of_two(t<<1) - 1u },
+  //_heap_mask   {(_next_pow2(t) << 1) - 1u},
+  //_heap_mask   { _next_pow2(t<<1) - 1u },
   //_heap_mask   {(t << 1) - 1},
-  _lheap_mask { _next_power_of_two((t+1) << 1) - 1 },
+  _lheap_mask { _next_pow2((t+1) << 1) - 1 },
   _lheaps     { _lheap_mask + 1 } {
 
   _blocklist_init_head(&_gheap.list);
@@ -567,12 +557,7 @@ void ObjectPool<T, S>::_for_each_block_safe(Blocklist* head, C&& c) {
 template <typename T, size_t S>
 T* ObjectPool<T, S>::_allocate(Block* s) {
   if(s->top == nullptr) {
-    //auto beg = reinterpret_cast<Block**>(&s->data + s->i++ * X);
-    //*beg = s;
-    //printf("beg=%p data=%p s=%p\n", *beg, beg+1, s);
-    //return reinterpret_cast<T*>(beg + O);  // (beg + 1) 
-    
-    return reinterpret_cast<T*>(&s->data + s->i++ * X);
+    return reinterpret_cast<T*>(s->data + s->i++ * X);
   }
   else {
     T* retval = s->top;
@@ -590,7 +575,8 @@ void ObjectPool<T, S>::_deallocate(Block* s, T* ptr) {
 
 // Function: allocate
 template <typename T, size_t S>
-T* ObjectPool<T, S>::allocate() {
+template <typename... ArgsT>
+T* ObjectPool<T, S>::animate(ArgsT&&... args) {
 
   //std::cout << "construct a new item\n";
     
@@ -602,7 +588,7 @@ T* ObjectPool<T, S>::allocate() {
   h.mutex.lock();
   
   // scan the list of superblocks from most full to least
-  int f = F-1;
+  int f = static_cast<int>(F-1);
   for(; f>=0; f--) {
     if(!_blocklist_is_empty(&h.lists[f])) {
       s = _block_of(h.lists[f].next);
@@ -621,7 +607,7 @@ T* ObjectPool<T, S>::allocate() {
       
       //printf("get a superblock from global heap %lu\n", s->u);
       assert(s->u < M && s->heap == nullptr);
-      f = _bin(s->u + 1);
+      f = static_cast<int>(_bin(s->u + 1));
 
       _blocklist_move_front(&s->list_node, &h.lists[f]);
 
@@ -664,7 +650,7 @@ T* ObjectPool<T, S>::allocate() {
   // take one item from the superblock
   T* mem = _allocate(s);
   
-  int b = _bin(s->u);
+  int b = static_cast<int>(_bin(s->u));
   
   if(b != f) {
     //printf("move superblock from list[%d] to list[%d]\n", f, b);
@@ -680,6 +666,8 @@ T* ObjectPool<T, S>::allocate() {
 
   //printf("allocate %p (s=%p)\n", mem, s);
 
+  new (mem) T(std::forward<ArgsT>(args)...);
+
   mem->_object_pool_block = s;
 
   return mem;
@@ -687,7 +675,7 @@ T* ObjectPool<T, S>::allocate() {
   
 // Function: destruct
 template <typename T, size_t S>
-void ObjectPool<T, S>::deallocate(T* mem) {
+void ObjectPool<T, S>::recycle(T* mem) {
 
   //Block* s = *reinterpret_cast<Block**>(
   //  reinterpret_cast<char*>(mem) - sizeof(Block**)
@@ -696,6 +684,8 @@ void ObjectPool<T, S>::deallocate(T* mem) {
   //Block* s= *(reinterpret_cast<Block**>(mem) - O); //  (mem) - 1
 
   Block* s = static_cast<Block*>(mem->_object_pool_block);
+
+  mem->~T();
   
   //printf("deallocate %p (s=%p) M=%lu W=%lu X=%lu\n", mem, s, M, W, X);
 
@@ -720,12 +710,12 @@ void ObjectPool<T, S>::deallocate(T* mem) {
       if(s->heap == h) {
         sync = true;
         // deallocate the item from the superblock
-        int f = _bin(s->u);
+        size_t f = _bin(s->u);
         _deallocate(s, mem);
         s->u = s->u - 1;
         h->u = h->u - 1;
 
-        int b = _bin(s->u);
+        size_t b = _bin(s->u);
 
         if(b != f) {
           //printf("move superblock from list[%d] to list[%d]\n", f, b);
@@ -762,14 +752,18 @@ typename ObjectPool<T, S>::LocalHeap&
 ObjectPool<T, S>::_this_heap() {
   // here we don't use thread local since object pool might be
   // created and destroyed multiple times
+  //thread_local auto hv = std::hash<std::thread::id>()(std::this_thread::get_id());
+  //return _lheaps[hv & _lheap_mask];
+
   return _lheaps[
     std::hash<std::thread::id>()(std::this_thread::get_id()) & _lheap_mask
   ];
 }
 
-// Function: _next_power_of_two
+// Function: _next_pow2
 template <typename T, size_t S>
-constexpr unsigned ObjectPool<T, S>::_next_power_of_two(unsigned n) const { 
+constexpr unsigned ObjectPool<T, S>::_next_pow2(unsigned n) const { 
+  if(n == 0) return 1;
   n--; 
   n |= n >> 1; 
   n |= n >> 2; 
