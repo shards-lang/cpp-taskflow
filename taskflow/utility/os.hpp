@@ -31,6 +31,11 @@
 #define TF_OS_DARWIN 1
 #endif
 
+#ifdef __EMSCRIPTEN__
+#undef TF_OS_LINUX
+#define TF_OS_LINUX 1
+#endif
+
 // in some ppc64 linux installations, only the second condition is met
 #if (defined __linux)
 #undef TF_OS_LINUX
@@ -96,7 +101,7 @@ inline std::string get_env(const std::string& str) {
 #ifdef _MSC_VER
   char *ptr = nullptr;
   size_t len = 0;
-  
+
   if(_dupenv_s(&ptr, &len, str.c_str()) == 0 && ptr != nullptr) {
     std::string res(ptr, len);
     std::free(ptr);
@@ -115,7 +120,7 @@ inline bool has_env(const std::string& str) {
 #ifdef _MSC_VER
   char *ptr = nullptr;
   size_t len = 0;
-  
+
   if(_dupenv_s(&ptr, &len, str.c_str()) == 0 && ptr != nullptr) {
     std::string res(ptr, len);
     std::free(ptr);
