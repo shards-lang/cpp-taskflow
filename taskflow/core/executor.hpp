@@ -765,15 +765,17 @@ class Executor {
 inline Executor::Executor(size_t N, std::shared_ptr<WorkerInterface> wix) :
   _MAX_STEALS {((N+1) << 1)},
   _threads    {N},
-  _workers    {N},
-  _notifier   {N},
-  _worker_interface {std::move(wix)} {
-
-  if(N == 0) {
-    TF_THROW("no cpu workers to execute taskflows");
+  _workers{std::max<size_t>(1, N)},
+  _notifier{std::max<size_t>(1, N)},
+  _worker_interface{std::move(wix)} {
+  if (N > 0) {
+      _spawn(N);
+  } else {
+      _workers[0]._id = 0;
+      _workers[0]._vtm = 0;
+      _workers[0]._executor = this;
+      _workers[0]._waiter = &_notifier._waiters[0];
   }
-
-  _spawn(N);
 
   // instantite the default observer if requested
   if(has_env(TF_ENABLE_PROFILER)) {
@@ -814,6 +816,8 @@ inline size_t Executor::num_taskflows() const {
 
 // Function: _this_worker
 inline Worker* Executor::_this_worker() {
+  if (_threads.empty())
+    return &_workers[0];
   auto itr = _wids.find(std::this_thread::get_id());
   return itr == _wids.end() ? nullptr : &_workers[itr->second];
 }
@@ -901,6 +905,8 @@ void Executor::silent_async(F&& f, ArgsT&&... args) {
 
 // Function: this_worker_id
 inline int Executor::this_worker_id() const {
+  if (_threads.empty())
+    return 0;
   auto i = _wids.find(std::this_thread::get_id());
   return i == _wids.end() ? -1 : static_cast<int>(_workers[i->second]._id);
 }
